@@ -9,6 +9,79 @@ SwitchHosts 的 macOS 托盘图标点击后会弹出一个小窗（`/tray` 路�
 **初始 bug**：当其他 App 处于全屏（独立的 full-screen Space）时，点击托盘图标，
 小窗无法显示在当前全屏页面上；用户必须手动回到桌面（常规 Space）才能看到它。
 
+## 2026-09-17 修复进展
+
+### 对历史分析的校正
+
+重新以已回退到 `master` 的源码为基线核对后，确认本文原来的时间线有两处不准确：
+
+1. 原始 `show_tray_window()` 并非只调用 `makeKeyAndOrderFront:`。当 App 不活跃时，它还会
+   调用 `activateIgnoringOtherApps:`。所以 Fix #1 阶段仍包含 Regular App 的全局激活，
+   “进入全屏 Space”和“激活 App 后发生 Space 切换”是两个叠加问题。
+2. 最终方案不需要手写新的 `WKWebView` 容器。现有 Tauri `WebviewWindow` 可以在原地转换
+   为 `NSPanel`，React `/tray` 页面、IPC、窗口定位和 capability 均可继续复用。
+
+更准确的根因分为三层：
+
+- `visible_on_all_workspaces(true)` 只有 `CanJoinAllSpaces`，缺少
+  `FullScreenAuxiliary`；
+- `always_on_top(true)` 只对应普通 floating level，不足以保证持续高于另一个 App 的
+  全屏窗口；
+- 普通 `NSWindow` 为获得交互而激活 Regular App，会触发或等待 Space 切换。
+
+### Fix #4 — 将现有 Tauri 窗口转换为 nonactivating NSPanel
+
+当前实现采用固定 revision 的 `tauri-nspanel 2.1.0`，只在 macOS 构建中启用。托盘
+WebView 仍由原来的 `WebviewWindowBuilder` 创建，随后转换为专用 `TrayPanel`：
+
+- `can_become_key_window = true`，允许 WebView 接收输入；
+- `can_become_main_window = false`，避免成为主窗口；
+- style mask 使用 `Borderless | NonactivatingPanel`；
+- collection behavior 使用 `CanJoinAllSpaces | FullScreenAuxiliary | Transient |
+  IgnoresCycle`；
+- level 使用 `PopUpMenu`，足以覆盖全屏 App 内容，同时不遮挡屏保、锁屏等受保护的
+  系统界面；
+- `hidesOnDeactivate = false`；
+- WebView 启用 `accept_first_mouse(true)`；
+- 显示时通过 panel 的 `show_and_make_key()`，不再调用
+  `activateIgnoringOtherApps:`。
+
+关闭路径仍保留项目的轻量化设计：先从 panel manager 中移除窗口并把原生类恢复为
+`NSWindow`，再交给 Tauri `close()` 销毁 WebView。这样不会因为 panel manager 持有引用
+而在每次开关托盘小窗后残留一个已关闭的 WebView。
+
+### 实测反馈与第二次调整
+
+第一版 Fix #4 使用 `Transient + PopUpMenu level`。用户实测确认小窗已经能出现在其他
+App 的全屏 Space 上，但移动鼠标后小窗会消失；普通桌面 Space 不受影响。
+
+最初怀疑全屏窗口重新排序导致 panel 层级不稳定，因此曾试验 `Stationary +
+ScreenSaver level`。用户第二次实测后现象完全不变，排除了窗口层级假设。
+
+继续检查关闭路径后定位到确定原因：`install_dismiss_monitors()` 使用原始
+`NSEventMask` 位运算，其中把 `1 << 5` 注释为 `OtherMouseDown`。但 NSEvent type 5 实际是
+`MouseMoved`，`OtherMouseDown` 是 type 25。于是当另一个 App 位于前台时，任何细微鼠标
+移动都会触发 global monitor，继而执行 `hide_tray_window()`；这也解释了为什么用户没有
+把鼠标移出小窗范围，小窗仍会立刻消失。
+
+当前修复将第三个掩码位改为 `1 << 25`，只监听左键、右键和其他鼠标键按下；同时撤回
+已被实测否定的层级试验，恢复 `Transient + PopUpMenu level`。新增结构回归测试，防止
+type 5 再次混入外部点击监听。修复已通过编译与自动化测试，等待用户进行第三轮真实
+全屏交互验证。
+
+### 自动化验证
+
+- `cargo check`：通过；
+- Rust：143 个单元测试通过；
+- 窗口结构测试：27 个通过，其中新增 3 个托盘窗口回归测试；
+- TypeScript 类型检查：通过；
+- Vitest：13 个测试文件、84 个测试通过；
+- ESLint：通过；
+- Playwright：本机缺少对应 Chromium 二进制，44 个用例未启动，不属于断言失败。
+
+> 后续真实 macOS 全屏行为由用户手工验证；自动化测试只保证配置与生命周期结构不会
+> 静默退回普通 `NSWindow` / 全局激活路径。
+
 下面记录针对这个 bug 家族连续做的三次修复，每次修复各自引入的新症状，以及最终
 认定的根因和架构结论。
 
@@ -220,13 +293,8 @@ Regular 还是 Accessory，都会要求系统切到 App 的 "home" Space——Re
 的前提下接收鼠标点击。Tauri 的 `WebviewWindowBuilder` 不支持这种面板，需要手写
 AppKit 代码承载 `WKWebView`，工作量明显更大。
 
-## 当前状态（已回退）
+## 当前状态
 
-最终决定回退到 **Fix #2** 版本：功能可用、可交互，但点击后有一段滑回桌面 Space 的
-动画。代码位于 `src-tauri/src/tray.rs`，包含：
-
-- `allow_tray_window_over_fullscreen_spaces()`（Fix #1 的 `FullScreenAuxiliary`，保留）；
-- `activate_for_tray_window()`（Fix #2 的 Accessory policy 临时切换，保留）。
-
-若要彻底消除滑动动画，需按"结论与根因"一节改为原生 `NSPanel` 架构，这是后续的
-独立重构项，不在此次修复范围内。
+上面的 Fix #1～#3 保留为排查历史，不再代表当前代码。当前实现已经进入 Fix #4：复用
+原有 Tauri WebView，将 macOS 托盘窗转换为 nonactivating `NSPanel`，并移除托盘显示路径
+中的 App 全局激活。最新代码与验证状态以本文开头的“2026-09-17 修复进展”为准。

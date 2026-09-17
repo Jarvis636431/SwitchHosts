@@ -568,9 +568,8 @@ fn configure_tray_panel<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<
             .ignores_cycle()
             .value(),
     );
-    // A tray popover belongs above ordinary floating windows. PopUpMenu is
-    // high enough for full-screen app content without using the much more
-    // intrusive ScreenSaver level, which would also cover system UI.
+    // A tray popover belongs above ordinary floating windows, but should not
+    // cover protected system UI such as the screen saver or lock screen.
     panel.set_level(PanelLevel::PopUpMenu.value());
     panel.set_floating_panel(true);
     panel.set_hides_on_deactivate(false);
@@ -753,9 +752,15 @@ fn install_dismiss_monitors<R: Runtime>(app: &AppHandle<R>) {
         return;
     }
 
-    // NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown |
-    // NSEventMaskOtherMouseDown — covers all mouse buttons.
-    const MASK: u64 = (1 << 1) | (1 << 3) | (1 << 5);
+    // NSEvent masks use `1 << NSEventType`. OtherMouseDown is event type 25,
+    // not 5 (type 5 is MouseMoved). Using `1 << 5` here makes every pointer
+    // movement in another app look like an outside click and instantly closes
+    // the panel, which is especially visible over another app's full-screen
+    // Space.
+    const LEFT_MOUSE_DOWN_MASK: u64 = 1 << 1;
+    const RIGHT_MOUSE_DOWN_MASK: u64 = 1 << 3;
+    const OTHER_MOUSE_DOWN_MASK: u64 = 1 << 25;
+    const MASK: u64 = LEFT_MOUSE_DOWN_MASK | RIGHT_MOUSE_DOWN_MASK | OTHER_MOUSE_DOWN_MASK;
 
     // Global monitor: clicks anywhere outside our app — other apps,
     // the desktop, the menu bar (incl. the tray icon itself).

@@ -494,6 +494,22 @@ fn macos_tray_uses_a_nonactivating_fullscreen_panel() {
 }
 
 #[test]
+fn macos_tray_global_monitor_does_not_treat_mouse_move_as_outside_click() {
+    const SOURCE: &str = include_str!("../src/tray.rs");
+    let monitor = extract_block_from(SOURCE, "fn install_dismiss_monitors")
+        .expect("macOS tray must install outside-click monitors");
+
+    assert!(
+        monitor.contains("OTHER_MOUSE_DOWN_MASK: u64 = 1 << 25"),
+        "NSEventType::OtherMouseDown is type 25 and its mask must use bit 25"
+    );
+    assert!(
+        !monitor.contains("const MASK: u64 = (1 << 1) | (1 << 3) | (1 << 5)"),
+        "NSEvent type 5 is MouseMoved; monitoring bit 5 closes the tray on any pointer movement"
+    );
+}
+
+#[test]
 fn macos_tray_panel_is_restored_before_destroying_its_webview() {
     const SOURCE: &str = include_str!("../src/tray.rs");
     let close = extract_block_from(SOURCE, "fn close_tray_window")
